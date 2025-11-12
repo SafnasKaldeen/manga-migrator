@@ -37,6 +37,20 @@ DEST_CONFIG = {
 MIGRATION_LOG = "migration_log.csv"
 CLOUDINARY_BASE = "manga"
 
+# Try to find existing metadata CSV
+METADATA_CSV_PATHS = [
+    "cloudinary_manga_metadata.csv",
+    "../cloudinary_manga_metadata.csv",
+    "scripts/cloudinary_manga_metadata.csv"
+]
+
+def find_metadata_csv():
+    """Find the metadata CSV file"""
+    for path in METADATA_CSV_PATHS:
+        if os.path.exists(path):
+            return path
+    return METADATA_CSV_PATHS[0]  # Default to first option
+
 # ============================================
 # DUAL CLOUDINARY CLIENT
 # ============================================

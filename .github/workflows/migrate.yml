@@ -52,7 +52,16 @@ jobs:
           DEST_CLOUDINARY_API_KEY: ${{ secrets.DEST_CLOUDINARY_API_KEY }}
           DEST_CLOUDINARY_API_SECRET: ${{ secrets.DEST_CLOUDINARY_API_SECRET }}
         run: |
-          cd scripts
+          # Find the migration script
+          if [ -f "scripts/migrate_cloudinary.py" ]; then
+            cd scripts
+          elif [ -f "migrate_cloudinary.py" ]; then
+            echo "Script found in root"
+          else
+            echo "❌ Cannot find migrate_cloudinary.py"
+            exit 1
+          fi
+
           if [ -n "${{ inputs.manga_slug }}" ]; then
             echo "🎯 Migrating specific manga: ${{ inputs.manga_slug }}"
             python migrate_cloudinary.py "${{ inputs.manga_slug }}"
@@ -66,8 +75,11 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: migration-log-${{ github.run_number }}
-          path: scripts/migration_log.csv
+          path: |
+            migration_log.csv
+            scripts/migration_log.csv
           retention-days: 90
+          if-no-files-found: warn
 
       - name: 📊 Commit migration log to repo
         if: always()
@@ -75,23 +87,35 @@ jobs:
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
 
-          if [ -f scripts/migration_log.csv ]; then
+          # Check for log file in different locations
+          if [ -f migration_log.csv ]; then
+            git add migration_log.csv
+          elif [ -f scripts/migration_log.csv ]; then
             git add scripts/migration_log.csv
-            git diff --quiet && git diff --staged --quiet || git commit -m "Update migration log [skip ci]"
-            git push
           fi
+
+          git diff --quiet && git diff --staged --quiet || git commit -m "Update migration log [skip ci]"
+          git push || echo "Nothing to push"
 
       - name: 📈 Migration summary
         if: always()
         run: |
-          if [ -f scripts/migration_log.csv ]; then
+          # Check for log file in different locations
+          LOG_FILE=""
+          if [ -f migration_log.csv ]; then
+            LOG_FILE="migration_log.csv"
+          elif [ -f scripts/migration_log.csv ]; then
+            LOG_FILE="scripts/migration_log.csv"
+          fi
+
+          if [ -n "$LOG_FILE" ]; then
             echo "📊 Migration Statistics:"
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
             
-            total=$(tail -n +2 scripts/migration_log.csv | wc -l)
-            success=$(grep ",success," scripts/migration_log.csv | wc -l)
-            failed=$(grep ",failed," scripts/migration_log.csv | wc -l)
-            skipped=$(grep ",skipped," scripts/migration_log.csv | wc -l)
+            total=$(tail -n +2 "$LOG_FILE" | wc -l)
+            success=$(grep ",success," "$LOG_FILE" | wc -l || echo "0")
+            failed=$(grep ",failed," "$LOG_FILE" | wc -l || echo "0")
+            skipped=$(grep ",skipped," "$LOG_FILE" | wc -l || echo "0")
             
             echo "Total processed: $total"
             echo "✅ Success: $success"
@@ -107,6 +131,8 @@ jobs:
             if [ $success -eq 0 ] && [ $skipped -eq $total ]; then
               echo "✨ Migration complete! All images already migrated."
             fi
+          else
+            echo "⚠️  No migration log found. Check if the script ran successfully."
           fi
 
   # Optional: Notify on completion
