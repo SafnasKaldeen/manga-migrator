@@ -3,6 +3,7 @@
 Cloudinary to Cloudinary Migration Script
 Migrates manga images from source to destination Cloudinary account
 Supports resume on timeout - skips already migrated images
+WITH PARALLEL PROCESSING for faster migration
 """
 
 import os
@@ -15,6 +16,8 @@ import cloudinary
 import cloudinary.uploader
 import cloudinary.api
 from urllib.parse import urlparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 # ============================================
 # CONFIGURATION
@@ -36,6 +39,10 @@ DEST_CONFIG = {
 
 MIGRATION_LOG = "migration_log.csv"
 CLOUDINARY_BASE = "manga"
+PARALLEL_WORKERS = 10  # Number of simultaneous uploads
+
+# Thread-safe lock for logging
+log_lock = threading.Lock()
 
 # Try to find existing metadata CSV
 METADATA_CSV_PATHS = [
@@ -92,27 +99,28 @@ def load_migration_log():
 
 
 def log_migration(source_path, dest_path, status, error=''):
-    """Log migration result"""
+    """Log migration result (thread-safe)"""
     
-    # Create log file if doesn't exist
-    if not os.path.exists(MIGRATION_LOG):
-        with open(MIGRATION_LOG, 'w', newline='', encoding='utf-8') as f:
+    with log_lock:
+        # Create log file if doesn't exist
+        if not os.path.exists(MIGRATION_LOG):
+            with open(MIGRATION_LOG, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    'timestamp', 'source_path', 'dest_path', 
+                    'status', 'error'
+                ])
+        
+        # Append result
+        with open(MIGRATION_LOG, 'a', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             writer.writerow([
-                'timestamp', 'source_path', 'dest_path', 
-                'status', 'error'
+                datetime.now().isoformat(),
+                source_path,
+                dest_path,
+                status,
+                error
             ])
-    
-    # Append result
-    with open(MIGRATION_LOG, 'a', newline='', encoding='utf-8') as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            datetime.now().isoformat(),
-            source_path,
-            dest_path,
-            status,
-            error
-        ])
 
 
 # ============================================
@@ -164,10 +172,10 @@ def get_all_resources_from_source(folder_prefix):
 # IMAGE MIGRATION
 # ============================================
 
-def migrate_image(resource, already_migrated):
+def migrate_image(resource, already_migrated, worker_id=0):
     """
     Migrate a single image from source to destination
-    Returns: (success, error_message)
+    Returns: (success, error_message, public_id, file_size_kb)
     """
     
     public_id = resource.get('public_id')
@@ -177,21 +185,18 @@ def migrate_image(resource, already_migrated):
     
     # Check if already migrated
     if public_id in already_migrated:
-        return True, "already_migrated"
+        return True, "already_migrated", public_id, 0
     
     try:
         # Download from source
-        print(f"  📥 Downloading from source...", end='', flush=True)
         CloudinaryClient.configure_source()
         
         response = requests.get(secure_url, timeout=30)
         response.raise_for_status()
         image_data = response.content
         file_size_kb = len(image_data) / 1024
-        print(f" {file_size_kb:.1f}KB", flush=True)
         
         # Upload to destination
-        print(f"  📤 Uploading to destination...", end='', flush=True)
         CloudinaryClient.configure_dest()
         
         # Ensure folder exists in destination
@@ -211,14 +216,10 @@ def migrate_image(resource, already_migrated):
             unique_filename=False
         )
         
-        dest_url = upload_result.get('secure_url')
-        print(f" Done! ✅", flush=True)
-        
-        return True, ""
+        return True, "", public_id, file_size_kb
         
     except Exception as e:
-        print(f" Failed! ❌", flush=True)
-        return False, str(e)
+        return False, str(e), public_id, 0
 
 
 # ============================================
@@ -278,54 +279,78 @@ def migrate_manga_folder(manga_slug=None):
             'failed': 0
         }
     
-    # Migrate images
+    # Migrate images with parallel processing
     success_count = 0
     failed_count = 0
     skipped_count = 0
+    total_size_mb = 0
     
-    print(f"🚀 Starting migration...\n")
+    print(f"🚀 Starting PARALLEL migration with {PARALLEL_WORKERS} workers...\n")
     
-    for idx, resource in enumerate(to_migrate, 1):
-        public_id = resource.get('public_id')
+    start_time = time.time()
+    processed = 0
+    
+    # Use ThreadPoolExecutor for parallel processing
+    with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as executor:
+        # Submit all tasks
+        future_to_resource = {
+            executor.submit(migrate_image, resource, already_migrated, i % PARALLEL_WORKERS): resource 
+            for i, resource in enumerate(to_migrate)
+        }
         
-        # Extract readable info
-        parts = public_id.split('/')
-        display_name = '/'.join(parts[-3:]) if len(parts) >= 3 else public_id
-        
-        try:
-            success, error = migrate_image(resource, already_migrated)
+        # Process completed tasks as they finish
+        for future in as_completed(future_to_resource):
+            processed += 1
+            resource = future_to_resource[future]
+            public_id = resource.get('public_id')
             
-            if success:
-                if error == "already_migrated":
-                    print(f"⏭️  [{idx}/{len(to_migrate)}] Skipped: {display_name}")
-                    skipped_count += 1
-                    log_migration(public_id, public_id, 'skipped', 'already_migrated')
+            # Extract readable info
+            parts = public_id.split('/')
+            display_name = '/'.join(parts[-3:]) if len(parts) >= 3 else public_id
+            
+            try:
+                success, error, public_id, file_size_kb = future.result()
+                total_size_mb += file_size_kb / 1024
+                
+                # Progress calculations
+                elapsed = time.time() - start_time
+                rate = processed / elapsed if elapsed > 0 else 0
+                eta_seconds = (len(to_migrate) - processed) / rate if rate > 0 else 0
+                eta_minutes = eta_seconds / 60
+                
+                if success:
+                    if error == "already_migrated":
+                        print(f"⏭️  [{processed}/{len(to_migrate)}] SKIP: {display_name}")
+                        skipped_count += 1
+                        log_migration(public_id, public_id, 'skipped', 'already_migrated')
+                    else:
+                        print(f"✅ [{processed}/{len(to_migrate)}] OK: {display_name} ({file_size_kb:.1f}KB)")
+                        success_count += 1
+                        log_migration(public_id, public_id, 'success', '')
+                        already_migrated.add(public_id)
                 else:
-                    print(f"✅ [{idx}/{len(to_migrate)}] Migrated: {display_name}")
-                    success_count += 1
-                    log_migration(public_id, public_id, 'success', '')
-                    already_migrated.add(public_id)
-            else:
-                print(f"❌ [{idx}/{len(to_migrate)}] Failed: {display_name}")
-                print(f"   Error: {error[:100]}")
+                    print(f"❌ [{processed}/{len(to_migrate)}] FAIL: {display_name}")
+                    print(f"   └─ Error: {error[:80]}")
+                    failed_count += 1
+                    log_migration(public_id, public_id, 'failed', error)
+                
+                # Checkpoint every 50 images
+                if processed % 50 == 0:
+                    print(f"\n{'═'*80}")
+                    print(f"🎯 CHECKPOINT: {processed}/{len(to_migrate)} ({(processed/len(to_migrate)*100):.1f}%)")
+                    print(f"   ✅ Success: {success_count} | ❌ Failed: {failed_count} | ⏭️  Skipped: {skipped_count}")
+                    print(f"   ⏱️  Elapsed: {elapsed/60:.1f}m | Rate: {rate*60:.1f}/min | ETA: {eta_minutes:.1f}m")
+                    print(f"   💾 Data migrated: {total_size_mb:.1f}MB")
+                    if processed > skipped_count:
+                        success_rate = (success_count/(processed-skipped_count)*100)
+                        print(f"   📈 Success rate: {success_rate:.1f}%")
+                    print(f"{'═'*80}\n")
+            
+            except Exception as e:
+                print(f"❌ [{processed}/{len(to_migrate)}] ERROR: {display_name}")
+                print(f"   └─ Exception: {str(e)[:80]}")
                 failed_count += 1
-                log_migration(public_id, public_id, 'failed', error)
-            
-            # Rate limiting
-            time.sleep(0.5)
-            
-            # Progress update every 50 images
-            if idx % 50 == 0:
-                print(f"\n📊 Progress: {idx}/{len(to_migrate)} processed")
-                print(f"   ✅ Success: {success_count} | ❌ Failed: {failed_count} | ⏭️  Skipped: {skipped_count}\n")
-        
-        except KeyboardInterrupt:
-            print("\n\n⚠️  Migration interrupted by user")
-            raise
-        except Exception as e:
-            print(f"❌ [{idx}/{len(to_migrate)}] Unexpected error: {str(e)[:100]}")
-            failed_count += 1
-            log_migration(public_id, public_id, 'failed', str(e))
+                log_migration(public_id, public_id, 'failed', str(e))
     
     # Final summary
     print("\n" + "="*80)
