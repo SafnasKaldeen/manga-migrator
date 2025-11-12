@@ -181,13 +181,17 @@ def migrate_image(resource, already_migrated):
     
     try:
         # Download from source
+        print(f"  📥 Downloading from source...", end='', flush=True)
         CloudinaryClient.configure_source()
         
         response = requests.get(secure_url, timeout=30)
         response.raise_for_status()
         image_data = response.content
+        file_size_kb = len(image_data) / 1024
+        print(f" {file_size_kb:.1f}KB", flush=True)
         
         # Upload to destination
+        print(f"  📤 Uploading to destination...", end='', flush=True)
         CloudinaryClient.configure_dest()
         
         # Ensure folder exists in destination
@@ -208,10 +212,12 @@ def migrate_image(resource, already_migrated):
         )
         
         dest_url = upload_result.get('secure_url')
+        print(f" Done! ✅", flush=True)
         
         return True, ""
         
     except Exception as e:
+        print(f" Failed! ❌", flush=True)
         return False, str(e)
 
 

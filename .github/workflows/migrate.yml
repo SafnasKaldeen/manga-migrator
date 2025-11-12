@@ -51,24 +51,45 @@ jobs:
           DEST_CLOUDINARY_CLOUD_NAME: ${{ secrets.DEST_CLOUDINARY_CLOUD_NAME }}
           DEST_CLOUDINARY_API_KEY: ${{ secrets.DEST_CLOUDINARY_API_KEY }}
           DEST_CLOUDINARY_API_SECRET: ${{ secrets.DEST_CLOUDINARY_API_SECRET }}
+
+          # Force unbuffered output for real-time logs
+          PYTHONUNBUFFERED: 1
         run: |
+          echo "════════════════════════════════════════════════════════════════════════════════"
+          echo "🚀 STARTING CLOUDINARY MIGRATION"
+          echo "════════════════════════════════════════════════════════════════════════════════"
+          echo ""
+          echo "📋 Configuration:"
+          echo "  Source Cloud: ${SOURCE_CLOUDINARY_CLOUD_NAME}"
+          echo "  Destination Cloud: ${DEST_CLOUDINARY_CLOUD_NAME}"
+          echo ""
+
           # Find the migration script
           if [ -f "scripts/migrate_cloudinary.py" ]; then
+            echo "✅ Found script in: scripts/migrate_cloudinary.py"
             cd scripts
           elif [ -f "migrate_cloudinary.py" ]; then
-            echo "Script found in root"
+            echo "✅ Found script in: ./migrate_cloudinary.py"
           else
             echo "❌ Cannot find migrate_cloudinary.py"
             exit 1
           fi
 
+          echo ""
+          echo "════════════════════════════════════════════════════════════════════════════════"
+
           if [ -n "${{ inputs.manga_slug }}" ]; then
             echo "🎯 Migrating specific manga: ${{ inputs.manga_slug }}"
-            python migrate_cloudinary.py "${{ inputs.manga_slug }}"
+            python -u migrate_cloudinary.py "${{ inputs.manga_slug }}"
           else
-            echo "📚 Migrating all manga"
-            python migrate_cloudinary.py
+            echo "📚 Migrating ALL manga from source to destination"
+            python -u migrate_cloudinary.py
           fi
+
+          echo ""
+          echo "════════════════════════════════════════════════════════════════════════════════"
+          echo "✅ Migration script completed"
+          echo "════════════════════════════════════════════════════════════════════════════════"
 
       - name: 💾 Upload migration log
         if: always()
