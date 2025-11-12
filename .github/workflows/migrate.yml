@@ -4,50 +4,49 @@ on:
   workflow_dispatch:
     inputs:
       manga_slug:
-        description: 'Specific manga to migrate (leave empty for all)'
+        description: "Specific manga to migrate (leave empty for all)"
         required: false
         type: string
-  
+
   # Schedule to run every 5 hours 45 minutes (before 6h timeout)
   # This allows automatic resume if migration is incomplete
   schedule:
-    - cron: '0 */6 * * *'  # Every 6 hours
+    - cron: "0 */6 * * *" # Every 6 hours
 
 jobs:
   migrate:
     runs-on: ubuntu-latest
-    timeout-minutes: 350  # 5h 50min - safe buffer before 6h limit
-    
+    timeout-minutes: 350 # 5h 50min - safe buffer before 6h limit
+
     steps:
       - name: 📥 Checkout repository
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-      
+
       - name: 🐍 Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-          cache: 'pip'
-      
+          python-version: "3.11"
+
       - name: 📦 Install dependencies
         run: |
           pip install --upgrade pip
           pip install requests beautifulsoup4 cloudinary
-      
+
       - name: 📄 Download migration log (if exists)
         continue-on-error: true
         run: |
           # Try to download existing migration log from artifacts
           echo "Checking for existing migration log..."
-          
+
       - name: ☁️ Run migration
         env:
           # Source Cloudinary (OLD account)
           SOURCE_CLOUDINARY_CLOUD_NAME: ${{ secrets.SOURCE_CLOUDINARY_CLOUD_NAME }}
           SOURCE_CLOUDINARY_API_KEY: ${{ secrets.SOURCE_CLOUDINARY_API_KEY }}
           SOURCE_CLOUDINARY_API_SECRET: ${{ secrets.SOURCE_CLOUDINARY_API_SECRET }}
-          
+
           # Destination Cloudinary (NEW account)
           DEST_CLOUDINARY_CLOUD_NAME: ${{ secrets.DEST_CLOUDINARY_CLOUD_NAME }}
           DEST_CLOUDINARY_API_KEY: ${{ secrets.DEST_CLOUDINARY_API_KEY }}
@@ -61,7 +60,7 @@ jobs:
             echo "📚 Migrating all manga"
             python migrate_cloudinary.py
           fi
-      
+
       - name: 💾 Upload migration log
         if: always()
         uses: actions/upload-artifact@v4
@@ -69,19 +68,19 @@ jobs:
           name: migration-log-${{ github.run_number }}
           path: scripts/migration_log.csv
           retention-days: 90
-      
+
       - name: 📊 Commit migration log to repo
         if: always()
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
-          
+
           if [ -f scripts/migration_log.csv ]; then
             git add scripts/migration_log.csv
             git diff --quiet && git diff --staged --quiet || git commit -m "Update migration log [skip ci]"
             git push
           fi
-      
+
       - name: 📈 Migration summary
         if: always()
         run: |
