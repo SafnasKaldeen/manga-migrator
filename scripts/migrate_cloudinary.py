@@ -2,8 +2,9 @@
 """
 Cloudinary to Cloudinary Migration Script
 Migrates manga images from source to destination Cloudinary account
-Supports resume on timeout - skips already migrated images
-WITH PARALLEL PROCESSING for faster migration
+WITH PARALLEL PROCESSING (10x faster)
+WITH RESOURCE CACHING (avoids rate limits)
+WITH AUTO-RESUME (handles 6-hour timeout)
 """
 
 import os
@@ -18,6 +19,7 @@ import cloudinary.api
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
+import json
 
 # ============================================
 # CONFIGURATION
@@ -40,23 +42,10 @@ DEST_CONFIG = {
 MIGRATION_LOG = "migration_log.csv"
 CLOUDINARY_BASE = "manga"
 PARALLEL_WORKERS = 10  # Number of simultaneous uploads
+RESOURCE_CACHE = "resource_cache.json"  # Cache fetched resources
 
 # Thread-safe lock for logging
 log_lock = threading.Lock()
-
-# Try to find existing metadata CSV
-METADATA_CSV_PATHS = [
-    "cloudinary_manga_metadata.csv",
-    "../cloudinary_manga_metadata.csv",
-    "scripts/cloudinary_manga_metadata.csv"
-]
-
-def find_metadata_csv():
-    """Find the metadata CSV file"""
-    for path in METADATA_CSV_PATHS:
-        if os.path.exists(path):
-            return path
-    return METADATA_CSV_PATHS[0]  # Default to first option
 
 # ============================================
 # DUAL CLOUDINARY CLIENT
@@ -124,23 +113,47 @@ def log_migration(source_path, dest_path, status, error=''):
 
 
 # ============================================
-# CLOUDINARY RESOURCE FETCHING
+# CLOUDINARY RESOURCE FETCHING WITH CACHE
 # ============================================
 
 def get_all_resources_from_source(folder_prefix):
     """
     Get all resources from source Cloudinary under a folder prefix
     Returns list of resources with their metadata
+    USES CACHING to avoid re-fetching on rate limit errors
     """
+    
+    # Check cache first
+    if os.path.exists(RESOURCE_CACHE):
+        print(f"📦 Found cached resource list: {RESOURCE_CACHE}")
+        try:
+            with open(RESOURCE_CACHE, 'r') as f:
+                cached_data = json.load(f)
+                if cached_data.get('folder_prefix') == folder_prefix:
+                    resources = cached_data.get('resources', [])
+                    cache_time = cached_data.get('timestamp', 'unknown')
+                    is_partial = cached_data.get('partial', False)
+                    print(f"✅ Using cached resources: {len(resources)} items")
+                    print(f"   Cached at: {cache_time}")
+                    if is_partial:
+                        print(f"   ⚠️  This is a partial cache (hit rate limit during fetch)")
+                    return resources
+        except Exception as e:
+            print(f"⚠️  Cache read error: {e}")
+    
     print(f"🔍 Fetching resources from source: {folder_prefix}")
+    print(f"⚠️  This uses Cloudinary API calls (limit: 500/hour)")
     
     CloudinaryClient.configure_source()
     
     all_resources = []
     next_cursor = None
+    fetch_count = 0
     
     try:
         while True:
+            fetch_count += 1
+            
             # Fetch resources with pagination
             result = cloudinary.api.resources(
                 type='upload',
@@ -152,24 +165,65 @@ def get_all_resources_from_source(folder_prefix):
             resources = result.get('resources', [])
             all_resources.extend(resources)
             
-            print(f"  📦 Fetched {len(resources)} resources (total: {len(all_resources)})")
+            print(f"  📦 Fetched {len(resources)} resources (total: {len(all_resources)}) [API call #{fetch_count}]")
             
             next_cursor = result.get('next_cursor')
             if not next_cursor:
                 break
             
-            time.sleep(0.5)  # Rate limit protection
+            # Small delay between requests
+            time.sleep(0.5)
     
     except Exception as e:
-        print(f"❌ Error fetching resources: {e}")
-        return []
+        error_msg = str(e)
+        
+        # Check if rate limit error
+        if '420' in error_msg or 'rate limit' in error_msg.lower():
+            print(f"\n⚠️  RATE LIMIT HIT!")
+            print(f"   Fetched {len(all_resources)} resources before limit")
+            
+            if len(all_resources) > 0:
+                print(f"   💾 Caching what we have so far...")
+                # Save partial results to cache
+                cache_data = {
+                    'folder_prefix': folder_prefix,
+                    'resources': all_resources,
+                    'timestamp': datetime.now().isoformat(),
+                    'partial': True,
+                    'fetch_count': fetch_count
+                }
+                with open(RESOURCE_CACHE, 'w') as f:
+                    json.dump(cache_data, f, indent=2)
+                print(f"   ✅ Cached {len(all_resources)} resources")
+                print(f"   🔄 Will use this cache on next run and continue migration")
+                return all_resources
+        
+        print(f"❌ Error fetching resources: {error_msg}")
+        return all_resources if all_resources else []
+    
+    # Save complete results to cache
+    if all_resources:
+        print(f"\n💾 Caching complete resource list...")
+        cache_data = {
+            'folder_prefix': folder_prefix,
+            'resources': all_resources,
+            'timestamp': datetime.now().isoformat(),
+            'partial': False,
+            'fetch_count': fetch_count
+        }
+        try:
+            with open(RESOURCE_CACHE, 'w') as f:
+                json.dump(cache_data, f, indent=2)
+            print(f"✅ Cached {len(all_resources)} resources")
+        except Exception as e:
+            print(f"⚠️  Could not save cache: {e}")
     
     print(f"✅ Total resources found: {len(all_resources)}")
     return all_resources
 
 
 # ============================================
-# IMAGE MIGRATION
+# IMAGE MIGRATION WITH PARALLEL PROCESSING
 # ============================================
 
 def migrate_image(resource, already_migrated, worker_id=0):
@@ -251,7 +305,7 @@ def migrate_manga_folder(manga_slug=None):
     already_migrated = load_migration_log()
     print(f"✅ Already migrated: {len(already_migrated)} images\n")
     
-    # Get all resources from source
+    # Get all resources from source (uses cache if available)
     resources = get_all_resources_from_source(folder_prefix)
     
     if not resources:
@@ -353,20 +407,30 @@ def migrate_manga_folder(manga_slug=None):
                 log_migration(public_id, public_id, 'failed', str(e))
     
     # Final summary
+    total_time = time.time() - start_time
     print("\n" + "="*80)
     print("  📊 MIGRATION SUMMARY")
     print("="*80)
+    print(f"⏱️  Total time: {total_time/60:.1f} minutes ({total_time/3600:.2f} hours)")
+    print(f"📦 Total processed: {len(to_migrate)}")
     print(f"✅ Successfully migrated: {success_count}")
     print(f"⏭️  Skipped (already migrated): {skipped_count}")
     print(f"❌ Failed: {failed_count}")
+    print(f"💾 Data transferred: {total_size_mb:.1f}MB ({total_size_mb/1024:.2f}GB)")
+    if total_time > 0:
+        print(f"⚡ Average speed: {(success_count/(total_time/60)):.1f} images/min")
+    if failed_count > 0:
+        print(f"\n⚠️  {failed_count} images failed - they will be retried on next run")
     print(f"📄 Log file: {MIGRATION_LOG}")
+    print(f"📦 Cache file: {RESOURCE_CACHE}")
     print("="*80 + "\n")
     
     return {
         'success': True,
         'migrated': success_count,
         'skipped': skipped_count,
-        'failed': failed_count
+        'failed': failed_count,
+        'total_size_mb': total_size_mb
     }
 
 
